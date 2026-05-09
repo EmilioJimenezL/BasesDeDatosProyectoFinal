@@ -7,4 +7,4 @@ data/pdfs/
 .venv/
 venv/
 .claude/
-.env.example
+.idea/
