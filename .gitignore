@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+data/pdfs/
+*.egg-info/
+.venv/
+venv/
+.claude/
+.env.example

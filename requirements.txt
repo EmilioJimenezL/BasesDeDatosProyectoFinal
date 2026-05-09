@@ -1,0 +1,11 @@
+streamlit
+mysql-connector-python
+pdfplumber
+scipy
+numpy
+pandas
+python-dotenv
+requests
+psutil
+google-generativeai
+ollama
