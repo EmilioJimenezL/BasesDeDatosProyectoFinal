@@ -76,7 +76,10 @@ def apply_tfidf(
     # Build weighted matrix
     weighted = [[0.0] * num_docs for _ in range(num_terms)]
     for i in range(num_terms):
-        idf = math.log(num_docs / (1 + doc_freq[i]))
+        # Clamp IDF at 0 — terms in every document otherwise produce
+        # negative weights (log(N/(1+df)) < 0 when df >= N) which yield
+        # confusing negative cosine scores downstream.
+        idf = max(0.0, math.log(num_docs / (1 + doc_freq[i])))
         for j in range(num_docs):
             if matrix[i][j] > 0 and doc_totals[j] > 0:
                 tf = matrix[i][j] / doc_totals[j]
