@@ -28,6 +28,14 @@ def compute_svd(
     """
     A = np.array(matrix, dtype=np.float64)
 
+    # Guard: all-zero matrix causes ARPACK "starting vector is zero"
+    if A.max() == 0:
+        raise ValueError(
+            "Frequency matrix is all zeros — no terms survived "
+            "preprocessing. Check that PDFs contain readable Spanish "
+            "text and the stop list is not filtering everything out."
+        )
+
     # Clamp k so svds doesn't crash
     max_k = min(A.shape) - 1
     if max_k < 1:
@@ -35,7 +43,13 @@ def compute_svd(
     k = min(k, max_k)
 
     A_sparse = csr_matrix(A)
-    U, s, Vt = svds(A_sparse, k=k)
+
+    # Deterministic non-zero v0 prevents ARPACK error -9 on
+    # sparse/near-zero matrices from newly added documents
+    rng = np.random.default_rng(seed=42)
+    v0 = rng.random(min(A_sparse.shape))
+
+    U, s, Vt = svds(A_sparse, k=k, v0=v0)
 
     # svds returns singular values in ascending order — reverse to descending
     idx = np.argsort(s)[::-1]
