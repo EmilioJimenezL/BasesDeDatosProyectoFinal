@@ -1,138 +1,86 @@
-# LSI Document Retrieval System
+# DocBase — LSI Document Retrieval System
 
-A document search engine built on **Latent Semantic Indexing (LSI)**. PDFs are ingested into MySQL, decomposed via truncated SVD, and queried through a Streamlit web UI. An optional LLM layer (Google Gemini or local Ollama) generates natural-language answers from the top results.
-
----
-
-## How it works
-
-```
-PDFs → extract text → preprocess → term-document matrix → SVD → MySQL
-                                                                    ↓
-                                              query → LSI space → cosine similarity → ranked results → LLM answer
-```
-
-1. **Ingestion** (`ingest.py`): reads PDFs, extracts text with `pdfplumber`, tokenizes, removes stop words, applies suffix rules (stored in MySQL), then writes term frequencies to the `HAS` table.
-2. **SVD** (`src/svd_engine.py`): builds a sparse term-document matrix and runs `scipy.sparse.linalg.svds` at rank *k*. The T, S, D factor matrices are stored in `SVD_MATRIX`.
-3. **Query** (`src/query_engine.py`): preprocesses the query string the same way as documents, projects it into the *k*-dimensional concept space, and ranks documents by cosine similarity.
-4. **UI** (`app.py`): Streamlit interface — enter a query, see ranked results with scores, optionally get an LLM-generated answer.
+A document retrieval system built on **Latent Semantic Indexing (LSI)** for the LIS-3012 Advanced Databases course at UDLAP. The system ingests a corpus of PDF documents (Ley Federal del Trabajo), processes them through a classical NLP pipeline, stores the frequency matrix in MySQL, and exposes a query interface via a local Streamlit web app. An optional LLM layer synthesizes natural-language answers from retrieved documents.
 
 ---
 
-## Project structure
+## What it does
 
-```
-.
-├── app.py                  # Streamlit web application
-├── ingest.py               # CLI ingestion script
-├── schema.sql              # Full MySQL schema (run once to initialize)
-├── requirements.txt        # Python dependencies
-├── .env.example            # Environment variable template
-│
-├── src/
-│   ├── db.py               # MySQL connection factory + CRUD helpers
-│   ├── pdf_extractor.py    # PDF text + metadata extraction (pdfplumber)
-│   ├── preprocessor.py     # Tokenization, stop-word removal, stemming
-│   ├── matrix_builder.py   # Sparse term-document matrix (scipy.sparse)
-│   ├── svd_engine.py       # Truncated SVD via scipy + persistence to DB
-│   ├── similarity.py       # Cosine similarity in LSI concept space
-│   ├── query_engine.py     # End-to-end query pipeline
-│   └── llm.py              # Gemini / Ollama answer generation
-│
-├── data/
-│   ├── pdfs/               # Drop input PDFs here (git-ignored)
-│   ├── stopwords/          # Optional flat stop-word files for bulk import
-│   └── suffixes/           # Optional suffix/replacement files for bulk import
-│
-├── tests/
-│   └── __init__.py
-└── notebooks/              # Jupyter exploration notebooks
-```
+1. Extracts text from encrypted/indexed PDFs using `pdfplumber`
+2. Preprocesses text through a stop-word list, suffix stripping, and word stemming (all stored in MySQL)
+3. Builds a term-document frequency matrix (FrecT) and stores it in a relational schema
+4. Decomposes FrecT using SVD (`scipy`) — an expert user selects the rank-k cutoff
+5. Answers queries by projecting them into LSI space and ranking documents using SQL-computed similarity functions (cosine, Dice, Jaccard, Euclidean)
+6. Optionally passes retrieved chunks to a local LLM (Ollama) or Gemini API for a natural-language answer
 
 ---
 
-## Database schema
+## Requirements
 
-MySQL 8+, database `docbase` (`utf8mb4 / utf8mb4_spanish_ci`).
+| Dependency | Version |
+|---|---|
+| Python | 3.9+ |
+| MySQL | 8.x |
+| Ollama *(optional)* | latest |
 
-| Table | Purpose |
-|-------|---------|
-| `DOCUMENT` | One row per ingested PDF — url, title, author, date |
-| `TERM` | Unique normalized terms (stems) across the corpus |
-| `WORD` | Raw word forms that map to each term |
-| `HAS` | Term frequency per document — the raw term-document matrix |
-| `SVD_MATRIX` | Stored T/S/D factor values from the SVD decomposition |
-| `QUERY` | Persisted query history, optionally linked to a top document |
-| `STOP_WORD` | Words excluded from indexing (loaded at preprocessing time) |
-| `SUFFIX` | Suffix → replacement rules used for stemming |
-
-**Key relationships:**
-- `WORD.term_id → TERM.id` (cascade delete)
-- `HAS.(document_id, term_id)` composite PK with cascade deletes on both sides
-- `SVD_MATRIX.(term_id, document_id)` both cascade on delete
-- `QUERY.document_id → DOCUMENT.id` sets NULL on delete
+All Python packages are listed in `requirements.txt`.
 
 ---
 
-## Prerequisites
+## Quick start
 
-- Python 3.9+
-- MySQL 8.0+ (running locally or remotely)
-- *(Optional)* [Ollama](https://ollama.com) with `llama3.2:3b` pulled, for local LLM answers
-- *(Optional)* A Google Gemini API key, for cloud LLM answers
-
----
-
-## Setup
-
-### 1. Clone and create a virtual environment
+### 1. Clone and install
 
 ```bash
-git clone <repo-url>
-cd ProyectoFinal
-python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-```
-
-### 2. Install dependencies
-
-```bash
+git clone https://github.com/your-username/docbase.git
+cd docbase
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment variables
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
+Edit `.env` with your MySQL credentials and (optionally) your Gemini API key:
 
-```ini
+```env
 DB_HOST=localhost
 DB_PORT=3306
 DB_USER=your_mysql_user
 DB_PASS=your_mysql_password
 DB_NAME=docbase
-GEMINI_API_KEY=your_gemini_api_key   # leave blank to skip Gemini
-OLLAMA_MODEL=llama3.2:3b             # change or leave blank to skip Ollama
+GEMINI_API_KEY=your_gemini_api_key   # optional
+OLLAMA_MODEL=llama3.2:3b             # optional
 ```
 
-### 4. Initialize the database
+### 3. Set up the database
 
 ```bash
-mysql -u your_mysql_user -p < schema.sql
+mysql -u your_user -p < schema.sql
 ```
 
-This creates the `docbase` database and all tables. Safe to re-run — all statements use `IF NOT EXISTS`.
+This creates the `docbase` database with all 8 tables using `utf8mb4_spanish_ci` collation for correct Spanish character handling.
 
-### 5. Ingest documents
+### 4. Add your PDF documents
 
-Drop PDF files into `data/pdfs/`, then run:
+Place PDF files in `data/pdfs/`. The system expects at least 10 documents. For the Ley Federal del Trabajo, one PDF per title or chapter works well:
+
+```
+data/pdfs/
+├── lft_01_titulo_primero.pdf
+├── lft_02_titulo_segundo.pdf
+├── ...
+```
+
+### 5. Run ingestion
 
 ```bash
 python ingest.py
 ```
+
+This extracts text from all PDFs, preprocesses it, builds the FrecT matrix, runs SVD, and stores everything in MySQL. Ingestion is idempotent — re-running it skips already-processed documents.
 
 ### 6. Launch the app
 
@@ -140,47 +88,138 @@ python ingest.py
 streamlit run app.py
 ```
 
-Open `http://localhost:8501` in your browser.
+Open your browser at `http://localhost:8501`.
 
 ---
 
-## Environment variables reference
+## Using the app
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DB_HOST` | Yes | MySQL host (default `localhost`) |
-| `DB_PORT` | Yes | MySQL port (default `3306`) |
-| `DB_USER` | Yes | MySQL username |
-| `DB_PASS` | Yes | MySQL password |
-| `DB_NAME` | Yes | Database name (default `docbase`) |
-| `GEMINI_API_KEY` | No | Google Gemini API key for cloud LLM answers |
-| `OLLAMA_MODEL` | No | Ollama model tag (e.g. `llama3.2:3b`) for local LLM answers |
+The Streamlit interface has four tabs:
 
----
+**Query** — Type a natural-language question. The system preprocesses it, projects it into LSI space, and returns the top-N most similar documents ranked by your chosen similarity function. If Ollama is running (or a Gemini key is set), a synthesized answer appears below the results.
 
-## Development notes
+**Matrix viewer** — Inspect the full FrecT frequency matrix and an optional heatmap. Useful for verifying ingestion worked correctly.
 
-- The `.venv/` directory is git-ignored. Every contributor runs `pip install -r requirements.txt` in their own venv.
-- `data/pdfs/` is git-ignored — do not commit PDFs to the repo.
-- `.env` is git-ignored — never commit credentials.
-- The `SUFFIX` table drives stemming: each row maps a suffix string to its replacement (empty string = strip). Load your own rules via `ingest.py` or direct SQL.
-- The SVD rank *k* controls the trade-off between precision and recall. A good starting point is 100–300 for a medium corpus; tune by inspecting retrieval quality.
-- Both LLM backends are optional. If neither `GEMINI_API_KEY` nor `OLLAMA_MODEL` is set, the app operates in retrieval-only mode.
+**SVD explorer** — View singular values as a bar chart, see explained variance, and change the rank-k cutoff. The system re-queries with the new k without re-running SVD.
+
+**Document browser** — Browse all documents in the corpus, view extracted text, and inspect the term-frequency vector for any document.
+
+### Sidebar controls
+
+| Control | Description |
+|---|---|
+| Similarity function | Cosine (default), Dice, Jaccard, Euclidean, Manhattan |
+| Top-N results | How many documents to return (1–20) |
+| SVD rank k | Number of singular values to retain |
+| Re-ingest | Trigger a fresh ingestion pass |
 
 ---
 
-## Dependencies
+## Project structure
 
-| Package | Purpose |
-|---------|---------|
-| `streamlit` | Web UI |
-| `mysql-connector-python` | MySQL driver |
-| `pdfplumber` | PDF text extraction |
-| `scipy` | Sparse SVD (`svds`) |
-| `numpy` | Numerical operations |
-| `pandas` | Tabular data handling |
-| `python-dotenv` | `.env` file loading |
-| `requests` | HTTP utilities |
-| `psutil` | System resource monitoring |
-| `google-generativeai` | Google Gemini LLM |
-| `ollama` | Local Ollama LLM client |
+```
+docbase/
+├── src/
+│   ├── db.py               # MySQL connection pool and query helpers
+│   ├── pdf_extractor.py    # PDF text extraction via pdfplumber
+│   ├── preprocessor.py     # Stop list, suffix stripping, stemming
+│   ├── matrix_builder.py   # FrecT construction and DB insertion
+│   ├── svd_engine.py       # SVD decomposition via scipy
+│   ├── similarity.py       # SQL similarity and distance functions
+│   ├── query_engine.py     # Full query pipeline: preprocess → project → rank
+│   └── llm.py              # Ollama / Gemini answer synthesis with fallback
+├── data/
+│   ├── pdfs/               # Source PDF corpus (not committed)
+│   ├── stopwords/          # Spanish stop-word lists
+│   └── suffixes/           # Spanish suffix rules
+├── tests/                  # Unit tests for similarity functions
+├── notebooks/              # Exploratory analysis
+├── app.py                  # Streamlit UI entry point
+├── ingest.py               # Ingestion pipeline entry point
+├── schema.sql              # MySQL DDL for all 8 tables
+├── requirements.txt
+├── .env.example
+└── README.md
+```
+
+---
+
+## Database schema
+
+Eight tables store the full pipeline state:
+
+| Table | Purpose |
+|---|---|
+| `DOCUMENT` | One row per PDF file with metadata |
+| `TERM` | Unique stemmed terms after preprocessing |
+| `WORD` | Raw word forms that map to each term |
+| `HAS` | The FrecT matrix — (document, term, frequency) triples |
+| `QUERY` | Saved queries linked to documents |
+| `SVD_MATRIX` | Stored T, S, D decomposition values per rank-k |
+| `STOP_WORD` | Spanish stop words used during preprocessing |
+| `SUFFIX` | Spanish suffix rules for stemming |
+
+The collation `utf8mb4_spanish_ci` is set at the database level so all Spanish characters (á, é, ó, ü, ñ) sort and compare correctly.
+
+---
+
+## Similarity functions
+
+All functions are implemented as SQL queries over the `HAS` table:
+
+| Function | Type | Best for |
+|---|---|---|
+| Cosine | Similarity | Natural language — angle between vectors |
+| Dice | Similarity | Balanced overlap measure |
+| Jaccard | Similarity | Penalises poorly shared terms |
+| Euclidean | Distance | Raw spatial distance |
+| Manhattan | Distance | City-block distance |
+
+---
+
+## LLM layer
+
+The LLM component is optional and the system degrades gracefully without it:
+
+- If **Ollama** is installed and running, the app auto-detects available RAM and selects the best model: `phi3:mini` (4 GB), `llama3.2:3b` (8 GB), or `qwen2.5:7b` (16 GB). `qwen2.5` is preferred for Spanish-language corpora.
+- If Ollama is unavailable, the app falls back to the **Gemini 1.5 Flash** API (free tier, requires a key in `.env`).
+- If neither is available, the app displays retrieved documents without a synthesized answer — all mandatory retrieval requirements still function.
+
+---
+
+## Running tests
+
+```bash
+python -m pytest tests/
+```
+
+Tests cover all four SQL similarity functions with known vectors and expected scores.
+
+---
+
+## ABET SO2 compliance
+
+This project was designed to satisfy the ABET Student Outcome 2 (SO2) rubric:
+
+| Criterion | Implementation |
+|---|---|
+| Identify objectives and constraints | Defined in project report: corpus size, DBMS requirement, similarity functions |
+| Analyze the problem | LSI theory, FrecT construction, SVD dimensionality reduction |
+| Evaluate solutions | Comparison of similarity metrics; FrecT vs. LSI precision tradeoff |
+| Develop solutions | Full pipeline from PDF ingestion to ranked retrieval |
+| Implement engineering design | Working system — this repository |
+| Non-technical considerations | Labor law access as a social equity and workers' rights issue |
+
+---
+
+## Course information
+
+- Course: LIS-3012 Advanced Databases
+- Institution: Universidad de las Américas Puebla (UDLAP)
+- Professor: Dr. José Luis Zechinelli Martini
+
+---
+
+## License
+
+MIT
