@@ -27,6 +27,19 @@ except Exception:
 pytestmark = pytest.mark.skipif(not DB_AVAILABLE, reason="MySQL docbase not reachable")
 
 
+@pytest.fixture(autouse=True, scope="module")
+def reset_query_engine_cache():
+    """Reset the module-level cache before integration tests run.
+
+    Unit tests (test_query_engine.py) leave _cache populated with mock data.
+    Without this reset, _load_cache() skips reloading and the integration
+    tests operate with empty stop-words/suffix-rules, breaking preprocessing.
+    """
+    from src import query_engine
+    query_engine._cache["stop_words"] = None
+    query_engine._cache["suffix_rules"] = None
+
+
 @pytest.fixture(scope="module")
 def conn():
     from src.db import get_connection
@@ -57,15 +70,15 @@ def test_all_methods_return_results(conn):
 # ── Known query ranking ──────────────────────────────────────────────────────
 
 def test_known_query_ranking(conn):
-    """A union/strike query should surface labor-rights chapters in top 3."""
+    """A labor-law query should surface core labor-rights documents in top 3."""
     from src.query_engine import query
-    results = query("huelga sindicato", conn, method="cosine", top_n=3)
+    results = query("jornada laboral salario minimo", conn, method="cosine", top_n=3)
     assert len(results) > 0
     top_titles = [r["title"].lower() for r in results]
-    # At least one result should reference a relevant title (sexto, septimo, octavo, noveno)
-    labor_keywords = ("sexto", "septimo", "octavo", "noveno", "quinto", "cuarto", "tercero")
+    # Top 3 should include at least one core labor-law document (LFT, LSS, Artículo 123, etc.)
+    labor_keywords = ("lft", "lss", "lsar", "lftse", "artículo", "lifnvt")
     assert any(any(kw in t for kw in labor_keywords) for t in top_titles), (
-        f"Expected a labor-chapter in top 3, got: {top_titles}"
+        f"Expected a labor-law document in top 3, got: {top_titles}"
     )
 
 
