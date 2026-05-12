@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import streamlit as st
@@ -114,6 +115,90 @@ def load_pdf_bytes(path: str) -> bytes:
         return f.read()
 
 
+# ── Search timeout ───────────────────────────────────────────────────────────
+
+class SearchTimeout(Exception):
+    pass
+
+
+def _run_query_with_timeout(query_fn, timeout_seconds: int = 45):
+    """Run query_fn() in a thread. Raises SearchTimeout if it takes too long."""
+    result_holder = [None]
+    error_holder = [None]
+
+    def target():
+        try:
+            result_holder[0] = query_fn()
+        except Exception as e:
+            error_holder[0] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        raise SearchTimeout(
+            f"La búsqueda tardó más de {timeout_seconds} segundos. "
+            f"Verifica la conexión a la base de datos."
+        )
+    if error_holder[0]:
+        raise error_holder[0]
+    return result_holder[0]
+
+
+# ── Result card renderer ─────────────────────────────────────────────────────
+
+def _render_results(results: list, query_tokens: list, passages: dict = None):
+    """Render result cards. Uses pre-loaded passages when available."""
+    conn = _ensure_conn()
+    total_terms = len(query_tokens)
+
+    for i, r in enumerate(results):
+        doc_rows = _safe_fetch(
+            "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
+            (r["document_id"],),
+        )
+        pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
+
+        with st.container(border=True):
+            col_score, col_title = st.columns([1, 5])
+            with col_score:
+                st.metric(
+                    label=f"#{i+1}",
+                    value=f"{r['score']:.4f}"
+                )
+            with col_title:
+                st.markdown(f"**{r['title']}**")
+                matched = _matched_terms_count(conn, r["document_id"], query_tokens)
+                st.caption(f"Términos coincidentes: {matched} / {total_terms}")
+
+                if pdf_path:
+                    if passages and r["document_id"] in passages:
+                        passage = passages[r["document_id"]]
+                    else:
+                        passage = llm.get_document_text(
+                            pdf_path, query_tokens=query_tokens, max_chars=400
+                        )
+                    if passage:
+                        st.caption("Fragmento relevante:")
+                        st.markdown(
+                            f"> {passage}",
+                            help="Fragmento con mayor coincidencia con la consulta"
+                        )
+
+            if pdf_path and os.path.exists(pdf_path):
+                pdf_bytes = load_pdf_bytes(pdf_path)
+                st.download_button(
+                    label=f"Descargar {r['title']}",
+                    data=pdf_bytes,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf",
+                    key=f"download_{r['document_id']}_{i}"
+                )
+
+            st.divider()
+
+
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
 def render_sidebar() -> dict:
@@ -201,6 +286,18 @@ def render_sidebar() -> dict:
 def render_query_tab(cfg: dict):
     st.header("Consulta en lenguaje natural")
 
+    # Session state initialization
+    if 'search_results' not in st.session_state:
+        st.session_state['search_results'] = []
+    if 'search_query' not in st.session_state:
+        st.session_state['search_query'] = ''
+    if 'llm_answer' not in st.session_state:
+        st.session_state['llm_answer'] = None
+    if 'query_tokens_cache' not in st.session_state:
+        st.session_state['query_tokens_cache'] = []
+    if 'passages_cache' not in st.session_state:
+        st.session_state['passages_cache'] = {}
+
     with st.form(key='search_form'):
         query_input = st.text_input(
             label="Consulta",
@@ -213,121 +310,133 @@ def render_query_tab(cfg: dict):
             use_container_width=False
         )
 
-    if not (search_submitted and query_input.strip()):
-        return
+    if search_submitted and query_input.strip():
+        # Clear previous results immediately
+        st.session_state['search_results'] = []
+        st.session_state['llm_answer'] = None
+        st.session_state['search_query'] = query_input
+        st.session_state['query_tokens_cache'] = []
+        st.session_state['passages_cache'] = {}
 
-    conn = _ensure_conn()
+        conn = _ensure_conn()
+        bar = st.progress(0, text="Preprocesando consulta...")
 
-    progress = st.progress(0, text="Buscando documentos...")
-    progress.progress(25, text="Preprocesando consulta...")
+        _tokens = _preprocess_query_terms(query_input, conn)
+        st.session_state['query_tokens_cache'] = _tokens
+        bar.progress(20, text="Consulta preprocesada.")
+        bar.progress(40, text="Proyectando al espacio LSI...")
 
-    try:
-        results = run_query(
-            query_input, conn,
-            method=cfg["method"], top_n=cfg["top_n"], k=cfg["k_rank"],
-        )
-        progress.progress(75, text="Calculando similitud...")
-        progress.progress(100, text="Búsqueda completada.")
-    except ValueError as e:
-        progress.empty()
-        st.error(str(e))
-        st.stop()
-    except mysql.connector.Error as e:
-        progress.empty()
-        st.error(f"Error de base de datos: {e}")
-        st.session_state.conn = None
-        st.stop()
+        try:
+            results = _run_query_with_timeout(
+                lambda: run_query(
+                    query_input, conn,
+                    method=cfg["method"], top_n=cfg["top_n"], k=cfg["k_rank"],
+                ),
+                timeout_seconds=45,
+            )
+        except SearchTimeout as e:
+            bar.empty()
+            st.error(str(e))
+            st.stop()
+        except ValueError as e:
+            bar.empty()
+            st.error(str(e))
+            st.stop()
+        except mysql.connector.Error as e:
+            bar.empty()
+            st.error(f"Error de base de datos: {e}")
+            st.session_state.conn = None
+            st.stop()
 
-    time.sleep(0.3)
-    progress.empty()
+        if not results:
+            bar.empty()
+            st.warning("No se encontraron documentos.")
+            st.stop()
 
-    if not results:
-        st.warning("No se encontraron documentos.")
-        return
+        bar.progress(80, text=f"{len(results)} documentos encontrados.")
+        bar.progress(90, text="Cargando fragmentos relevantes...")
 
-    query_terms = _preprocess_query_terms(query_input, conn)
-    total_terms = len(query_terms)
-
-    provider = st.session_state.get('llm_provider', 'none')
-    model = st.session_state.get('llm_model', None)
-
-    if provider != 'none':
-        st.subheader("Síntesis")
-        llm_progress = st.progress(0, text="Iniciando modelo...")
-        llm_progress.progress(30, text="Analizando fragmentos relevantes...")
-
+        # Pre-load PDF paths and passages once per document, reuse for LLM
+        passages = {}
         results_for_llm = []
         for r in results:
             doc_rows = _safe_fetch(
                 "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
                 (r["document_id"],),
             )
-            url = doc_rows[0]["url"] if doc_rows else None
+            pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
+            if pdf_path:
+                passages[r["document_id"]] = llm.get_document_text(
+                    pdf_path, query_tokens=_tokens, max_chars=400
+                )
             results_for_llm.append({
                 "document_id": r["document_id"],
                 "title": r["title"],
-                "url": _resolve_pdf_path({"url": url, "title": r["title"]}),
+                "url": pdf_path or (r.get("title", "") + ".pdf"),
+                "score": r.get("score", 0),
             })
 
-        answer = llm.synthesize(
-            query_input, results_for_llm,
-            provider=provider,
-            model=model,
-            query_tokens=query_terms
-        )
+        bar.progress(100, text="Listo.")
+        time.sleep(0.2)
+        bar.empty()
 
-        llm_progress.progress(100, text="Síntesis completada.")
-        time.sleep(0.3)
-        llm_progress.empty()
+        # LLM synthesis — runs after query, before render
+        answer = None
+        provider = st.session_state.get('llm_provider', 'none')
+        model = st.session_state.get('llm_model', None)
 
-        if answer:
-            st.markdown(answer)
-            st.caption(f"Generado por {model} · basado en los documentos recuperados")
-
-        st.divider()
-
-    is_distance = cfg["method"] in DISTANCE_METHODS
-    for i, r in enumerate(results):
-        doc_rows = _safe_fetch(
-            "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
-            (r["document_id"],),
-        )
-        pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
-
-        with st.container(border=True):
-            col_score, col_title = st.columns([1, 5])
-            with col_score:
-                st.metric(
-                    label=f"#{i+1}",
-                    value=f"{r['score']:.4f}"
-                )
-            with col_title:
-                st.markdown(f"**{r['title']}**")
-                matched = _matched_terms_count(conn, r["document_id"], query_terms)
-                st.caption(f"Términos coincidentes: {matched} / {total_terms}")
-
-                if pdf_path:
-                    passage = llm.get_document_text(
-                        pdf_path, query_tokens=query_terms, max_chars=400
+        if provider != 'none':
+            with st.status("Generando síntesis...", expanded=False) as status:
+                status.write("Leyendo documentos recuperados...")
+                try:
+                    answer = _run_query_with_timeout(
+                        lambda: llm.synthesize(
+                            query_input, results_for_llm,
+                            provider=provider,
+                            model=model,
+                            query_tokens=_tokens,
+                        ),
+                        timeout_seconds=120,
                     )
-                    if passage:
-                        st.caption("Fragmento relevante:")
-                        st.markdown(
-                            f"> {passage}",
-                            help="Fragmento con mayor coincidencia con la consulta"
-                        )
+                except SearchTimeout:
+                    answer = None
 
-            if pdf_path and os.path.exists(pdf_path):
-                pdf_bytes = load_pdf_bytes(pdf_path)
-                st.download_button(
-                    label=f"Descargar {r['title']}",
-                    data=pdf_bytes,
-                    file_name=os.path.basename(pdf_path),
-                    mime="application/pdf",
-                    key=f"download_{r['document_id']}_{i}"
-                )
+                if answer:
+                    status.update(
+                        label="Síntesis completada.",
+                        state="complete",
+                        expanded=False,
+                    )
+                else:
+                    status.update(
+                        label="No se pudo generar una síntesis.",
+                        state="error",
+                        expanded=False,
+                    )
 
+        # Persist in session state for subsequent reruns
+        st.session_state['search_results'] = results
+        st.session_state['llm_answer'] = answer
+        st.session_state['passages_cache'] = passages
+
+    # Render from session state — runs on EVERY render, not just after search
+    if st.session_state['search_results']:
+        _answer = st.session_state.get('llm_answer')
+        _query_tokens = st.session_state.get('query_tokens_cache', [])
+        _passages = st.session_state.get('passages_cache', {})
+
+        # LLM synthesis answer first
+        if _answer:
+            st.subheader("Síntesis")
+            st.markdown(_answer)
             st.divider()
+
+        # Result cards below
+        _render_results(
+            st.session_state['search_results'],
+            _query_tokens,
+            _passages,
+        )
 
 
 # ── Tab 2 — Matriz FrecT ────────────────────────────────────────────────────

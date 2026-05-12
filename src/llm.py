@@ -17,11 +17,18 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_URL = "http://localhost:11434"
 SYSTEM_PROMPT = (
-    "Eres un asistente legal especializado en la Ley Federal del Trabajo "
-    "de México. Responde en español, de forma clara y concisa. Basa tu "
-    "respuesta ÚNICAMENTE en los fragmentos de ley proporcionados. "
-    "Si la información no está en los fragmentos, dilo explícitamente. "
-    "No inventes artículos ni números de ley."
+    "Eres un asistente legal especializado en la legislación "
+    "laboral mexicana. Responde en español, de forma clara y "
+    "concisa. Basa tu respuesta ÚNICAMENTE en los fragmentos "
+    "proporcionados. "
+    "INSTRUCCIÓN OBLIGATORIA: Al final de tu respuesta, incluye "
+    "una sección titulada 'Fuente principal:' donde cites "
+    "textualmente el fragmento más relevante del documento más "
+    "relevante (máximo 2 oraciones). Usa este formato exacto:\n"
+    "Fuente principal: [título del documento]\n"
+    "'[cita textual del fragmento más relevante]'\n"
+    "Si la información no está en los fragmentos, indícalo "
+    "explícitamente. No inventes artículos ni números de ley."
 )
 
 
@@ -222,7 +229,33 @@ def synthesize(query: str, results: list[dict],
     if provider == 'none':
         return None
 
-    prompt = _build_prompt(query, results or [], query_tokens=query_tokens)
+    # Build user prompt with all retrieved documents; mark the most relevant
+    fragments_text = ""
+    for i, r in enumerate(results or []):
+        url = r.get("url") or f"{r.get('title', 'unknown')}.pdf"
+        if url and not os.path.isabs(url) and not url.startswith("data/"):
+            pdf_path = os.path.join("data", "pdfs", url)
+        else:
+            pdf_path = url
+        text = get_document_text(pdf_path, query_tokens=query_tokens, max_chars=800)
+        if not text:
+            continue
+        marker = " [DOCUMENTO MÁS RELEVANTE]" if i == 0 else ""
+        fragments_text += (
+            f"\n--- {r.get('title', 'doc')}{marker} "
+            f"(similitud: {r.get('score', 0):.4f}) ---\n{text}\n"
+        )
+
+    if not fragments_text:
+        fragments_text = "(sin fragmentos)"
+
+    prompt = (
+        f"Pregunta: {query}\n\n"
+        f"Fragmentos de la legislación laboral mexicana:\n"
+        f"{fragments_text}\n\n"
+        "Responde la pregunta y al final cita el fragmento más "
+        "relevante como se indicó en las instrucciones."
+    )
 
     if provider == "ollama":
         return _call_ollama(model, prompt)
