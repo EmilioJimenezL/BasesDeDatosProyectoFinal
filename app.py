@@ -321,12 +321,10 @@ def render_query_tab(cfg: dict):
         conn = _ensure_conn()
         bar = st.progress(0, text="Preprocesando consulta...")
 
-        _tokens = _preprocess_query_terms(query_input, conn)
-        st.session_state['query_tokens_cache'] = _tokens
-        bar.progress(20, text="Consulta preprocesada.")
-        bar.progress(40, text="Proyectando al espacio LSI...")
-
         try:
+            _tokens = _preprocess_query_terms(query_input, conn)
+            bar.progress(25, text="Proyectando al espacio LSI...")
+
             results = _run_query_with_timeout(
                 lambda: run_query(
                     query_input, conn,
@@ -334,6 +332,31 @@ def render_query_tab(cfg: dict):
                 ),
                 timeout_seconds=45,
             )
+            bar.progress(75, text=f"{len(results)} documentos encontrados.")
+
+            # Pre-load passages for cards; also build url-enriched list for LLM
+            passages = {}
+            results_for_llm = []
+            for r in results:
+                doc_rows = _safe_fetch(
+                    "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
+                    (r["document_id"],),
+                )
+                pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
+                if pdf_path:
+                    passages[r["document_id"]] = llm.get_document_text(
+                        pdf_path, query_tokens=_tokens, max_chars=400
+                    )
+                results_for_llm.append({
+                    "document_id": r["document_id"],
+                    "title": r["title"],
+                    "url": pdf_path or (r.get("title", "") + ".pdf"),
+                    "score": r.get("score", 0),
+                })
+            bar.progress(100, text="Listo.")
+            time.sleep(0.2)
+            bar.empty()
+
         except SearchTimeout as e:
             bar.empty()
             st.error(str(e))
@@ -348,95 +371,79 @@ def render_query_tab(cfg: dict):
             st.session_state.conn = None
             st.stop()
 
-        if not results:
-            bar.empty()
-            st.warning("No se encontraron documentos.")
+        # Save to session state
+        st.session_state['search_results'] = results
+        st.session_state['llm_answer'] = None
+        st.session_state['passages_cache'] = passages
+        st.session_state['query_tokens_cache'] = _tokens
+
+        # Render result cards immediately (no waiting for LLM)
+        if results:
+            st.subheader(f"Resultados — {METHOD_LABELS.get(cfg['method'], cfg['method'])}")
+            _render_results(results, _tokens, passages)
+        else:
+            st.info("No se encontraron documentos para esta consulta.")
             st.stop()
 
-        bar.progress(80, text=f"{len(results)} documentos encontrados.")
-        bar.progress(90, text="Cargando fragmentos relevantes...")
-
-        # Pre-load PDF paths and passages once per document, reuse for LLM
-        passages = {}
-        results_for_llm = []
-        for r in results:
-            doc_rows = _safe_fetch(
-                "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
-                (r["document_id"],),
-            )
-            pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
-            if pdf_path:
-                passages[r["document_id"]] = llm.get_document_text(
-                    pdf_path, query_tokens=_tokens, max_chars=400
-                )
-            results_for_llm.append({
-                "document_id": r["document_id"],
-                "title": r["title"],
-                "url": pdf_path or (r.get("title", "") + ".pdf"),
-                "score": r.get("score", 0),
-            })
-
-        bar.progress(100, text="Listo.")
-        time.sleep(0.2)
-        bar.empty()
-
-        # LLM synthesis — runs after query, before render
-        answer = None
+        # Run LLM synthesis AFTER cards are rendered — direct call, no thread wrapper
         provider = st.session_state.get('llm_provider', 'none')
-        model = st.session_state.get('llm_model', None)
+        model    = st.session_state.get('llm_model', None)
 
-        if provider != 'none':
-            with st.status("Generando síntesis...", expanded=False) as status:
-                status.write("Leyendo documentos recuperados...")
+        if provider != 'none' and results:
+            st.divider()
+            st.subheader("Síntesis")
+
+            with st.status("Generando síntesis...", expanded=True) as status:
+                status.write(
+                    f"Analizando {len(results)} documentos con "
+                    f"{model or provider}..."
+                )
                 try:
-                    answer = _run_query_with_timeout(
-                        lambda: llm.synthesize(
-                            query_input, results_for_llm,
-                            provider=provider,
-                            model=model,
-                            query_tokens=_tokens,
-                        ),
-                        timeout_seconds=120,
+                    answer = llm.synthesize(
+                        query_input,
+                        results_for_llm,
+                        provider=provider,
+                        model=model,
+                        query_tokens=_tokens,
                     )
-                except SearchTimeout:
-                    answer = None
-
-                if answer:
+                    if answer:
+                        st.session_state['llm_answer'] = answer
+                        status.update(
+                            label="Síntesis completada.",
+                            state="complete",
+                            expanded=False,
+                        )
+                        st.markdown(answer)
+                    else:
+                        status.update(
+                            label="El modelo no generó una respuesta.",
+                            state="error",
+                            expanded=False,
+                        )
+                except Exception as e:
                     status.update(
-                        label="Síntesis completada.",
-                        state="complete",
-                        expanded=False,
-                    )
-                else:
-                    status.update(
-                        label="No se pudo generar una síntesis.",
+                        label=f"Error en síntesis: {str(e)[:80]}",
                         state="error",
                         expanded=False,
                     )
 
-        # Persist in session state for subsequent reruns
-        st.session_state['search_results'] = results
-        st.session_state['llm_answer'] = answer
-        st.session_state['passages_cache'] = passages
-
-    # Render from session state — runs on EVERY render, not just after search
-    if st.session_state['search_results']:
+    # Render from session state — runs on rerenders when search is not submitted
+    elif st.session_state['search_results']:
         _answer = st.session_state.get('llm_answer')
         _query_tokens = st.session_state.get('query_tokens_cache', [])
         _passages = st.session_state.get('passages_cache', {})
 
-        # LLM synthesis answer first
-        if _answer:
-            st.subheader("Síntesis")
-            st.markdown(_answer)
-            st.divider()
-
-        # Result cards below
+        # Result cards first, LLM answer below
         _render_results(
             st.session_state['search_results'],
             _query_tokens,
             _passages,
         )
+
+        if _answer:
+            st.divider()
+            st.subheader("Síntesis")
+            st.markdown(_answer)
 
 
 # ── Tab 2 — Matriz FrecT ────────────────────────────────────────────────────
