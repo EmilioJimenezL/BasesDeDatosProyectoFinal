@@ -3,13 +3,14 @@
 import os
 import subprocess
 import sys
+import time
 
 import streamlit as st
 
 # ── Page config MUST be the first Streamlit call ────────────────────────────
 st.set_page_config(
     page_title="DocBase — Ley Federal del Trabajo",
-    page_icon="⚖️",
+    page_icon="DB",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -52,10 +53,6 @@ def _ensure_conn():
         conn = get_connection()
         st.session_state.conn = conn
     return conn
-
-
-if "llm_info" not in st.session_state:
-    st.session_state.llm_info = llm.detect_llm()
 
 
 # ── DB helpers ──────────────────────────────────────────────────────────────
@@ -111,11 +108,17 @@ def _preprocess_query_terms(text: str, conn) -> list:
     return preprocess_query(text, _cache["stop_words"], _cache["suffix_rules"])
 
 
+@st.cache_data
+def load_pdf_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 
 def render_sidebar() -> dict:
     with st.sidebar:
-        st.title("⚖️ DocBase")
+        st.title("DocBase")
         st.caption("LIS-3012 · UDLAP")
 
         st.subheader("Configuración de búsqueda")
@@ -157,17 +160,28 @@ def render_sidebar() -> dict:
         )
         st.dataframe(stats, use_container_width=True, hide_index=True)
 
-        info = st.session_state.llm_info
-        if info["provider"] == "ollama":
-            st.markdown(f"🟢 **Ollama** (`{info['model']}`)")
-        elif info["provider"] == "gemini":
-            st.markdown("🟡 **Gemini Flash** (API)")
-        else:
-            st.markdown("🔴 **Sin LLM** (solo recuperación)")
+        st.divider()
+        st.subheader("Modelo de lenguaje")
+
+        available = llm.get_available_models()
+
+        selected_idx = st.selectbox(
+            label="Modelo para síntesis",
+            options=available['options'],
+            index=available['default_index'],
+            key='llm_selector'
+        )
+
+        sel_provider, sel_model = available['values'][
+            available['options'].index(selected_idx)
+        ]
+
+        st.session_state['llm_provider'] = sel_provider
+        st.session_state['llm_model'] = sel_model
 
         st.divider()
         st.subheader("Herramientas")
-        if st.button("🔄 Re-indexar corpus", use_container_width=True):
+        if st.button("Re-indexar corpus", use_container_width=True):
             with st.spinner("Re-indexando..."):
                 result = subprocess.run(
                     [sys.executable, "ingest.py"],
@@ -187,34 +201,45 @@ def render_sidebar() -> dict:
 def render_query_tab(cfg: dict):
     st.header("Consulta en lenguaje natural")
 
-    query_input = st.text_input(
-        "Escribe tu consulta",
-        placeholder="Ejemplo: ¿Cuáles son los derechos del trabajador en caso de despido?",
-        key="query_input",
-    )
+    with st.form(key='search_form'):
+        query_input = st.text_input(
+            label="Consulta",
+            placeholder="Ejemplo: jornada laboral salario mínimo",
+            key="query_input"
+        )
+        search_submitted = st.form_submit_button(
+            label="Buscar",
+            type="primary",
+            use_container_width=False
+        )
 
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        search_btn = st.button("🔍 Buscar", type="primary", use_container_width=True)
-    with col2:
-        st.caption("La consulta pasa por el mismo preprocesamiento que los documentos.")
-
-    if not (search_btn and query_input):
+    if not (search_submitted and query_input.strip()):
         return
 
     conn = _ensure_conn()
+
+    progress = st.progress(0, text="Buscando documentos...")
+    progress.progress(25, text="Preprocesando consulta...")
+
     try:
         results = run_query(
             query_input, conn,
             method=cfg["method"], top_n=cfg["top_n"], k=cfg["k_rank"],
         )
+        progress.progress(75, text="Calculando similitud...")
+        progress.progress(100, text="Búsqueda completada.")
     except ValueError as e:
+        progress.empty()
         st.error(str(e))
-        return
+        st.stop()
     except mysql.connector.Error as e:
+        progress.empty()
         st.error(f"Error de base de datos: {e}")
         st.session_state.conn = None
-        return
+        st.stop()
+
+    time.sleep(0.3)
+    progress.empty()
 
     if not results:
         st.warning("No se encontraron documentos.")
@@ -223,73 +248,86 @@ def render_query_tab(cfg: dict):
     query_terms = _preprocess_query_terms(query_input, conn)
     total_terms = len(query_terms)
 
-    st.subheader(f"Top {cfg['top_n']} documentos — {METHOD_LABELS[cfg['method']]}")
+    provider = st.session_state.get('llm_provider', 'none')
+    model = st.session_state.get('llm_model', None)
 
-    is_distance = cfg["method"] in DISTANCE_METHODS
-    for rank, r in enumerate(results, start=1):
-        with st.container(border=True):
-            top = st.columns([1, 6, 2])
-            with top[0]:
-                st.markdown(f"### #{rank}")
-            with top[1]:
-                st.markdown(f"**{r['title']}**")
-            with top[2]:
-                label = "Distancia" if is_distance else "Similitud"
-                st.metric(label, f"{r['score']:.4f}")
+    if provider != 'none':
+        st.subheader("Síntesis")
+        llm_progress = st.progress(0, text="Iniciando modelo...")
+        llm_progress.progress(30, text="Analizando fragmentos relevantes...")
 
-            if is_distance:
-                bar_value = 1.0 / (1.0 + max(r["score"], 0.0))
-            else:
-                bar_value = max(0.0, min(1.0, float(r["score"])))
-            st.progress(bar_value)
+        results_for_llm = []
+        for r in results:
+            doc_rows = _safe_fetch(
+                "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
+                (r["document_id"],),
+            )
+            url = doc_rows[0]["url"] if doc_rows else None
+            results_for_llm.append({
+                "document_id": r["document_id"],
+                "title": r["title"],
+                "url": _resolve_pdf_path({"url": url, "title": r["title"]}),
+            })
 
-            matched = _matched_terms_count(conn, r["document_id"], query_terms)
-            st.caption(f"Términos coincidentes: {matched} / {total_terms}")
+        answer = llm.synthesize(
+            query_input, results_for_llm,
+            provider=provider,
+            model=model,
+            query_tokens=query_terms
+        )
 
-            with st.expander("Ver fragmento"):
-                doc_rows = _safe_fetch(
-                    "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
-                    (r["document_id"],),
-                )
-                if doc_rows:
-                    pdf_path = _resolve_pdf_path(doc_rows[0])
-                    snippet = llm.get_document_text(pdf_path, max_chars=400)
-                    if snippet:
-                        st.text(snippet)
-                    else:
-                        st.caption("No se pudo extraer texto del PDF.")
+        llm_progress.progress(100, text="Síntesis completada.")
+        time.sleep(0.3)
+        llm_progress.empty()
 
-    info = st.session_state.llm_info
-    if info["available"]:
-        st.divider()
-        st.subheader("💬 Respuesta sintetizada")
-        with st.spinner("Consultando modelo de lenguaje..."):
-            results_for_llm = []
-            for r in results:
-                doc_rows = _safe_fetch(
-                    "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
-                    (r["document_id"],),
-                )
-                url = doc_rows[0]["url"] if doc_rows else None
-                results_for_llm.append({
-                    "document_id": r["document_id"],
-                    "title": r["title"],
-                    "url": _resolve_pdf_path({"url": url, "title": r["title"]}),
-                })
-            answer = llm.synthesize(query_input, results_for_llm, info)
         if answer:
             st.markdown(answer)
-            st.caption(
-                f"Generado por {info['model']} · "
-                "basado en los documentos recuperados"
-            )
-        else:
-            st.warning(
-                "El modelo no pudo generar una respuesta. "
-                "Se muestran los documentos recuperados."
-            )
-    else:
-        st.info(f"ℹ️ {info['reason']}")
+            st.caption(f"Generado por {model} · basado en los documentos recuperados")
+
+        st.divider()
+
+    is_distance = cfg["method"] in DISTANCE_METHODS
+    for i, r in enumerate(results):
+        doc_rows = _safe_fetch(
+            "SELECT id, url, title FROM DOCUMENT WHERE id = %s",
+            (r["document_id"],),
+        )
+        pdf_path = _resolve_pdf_path(doc_rows[0]) if doc_rows else None
+
+        with st.container(border=True):
+            col_score, col_title = st.columns([1, 5])
+            with col_score:
+                st.metric(
+                    label=f"#{i+1}",
+                    value=f"{r['score']:.4f}"
+                )
+            with col_title:
+                st.markdown(f"**{r['title']}**")
+                matched = _matched_terms_count(conn, r["document_id"], query_terms)
+                st.caption(f"Términos coincidentes: {matched} / {total_terms}")
+
+                if pdf_path:
+                    passage = llm.get_document_text(
+                        pdf_path, query_tokens=query_terms, max_chars=400
+                    )
+                    if passage:
+                        st.caption("Fragmento relevante:")
+                        st.markdown(
+                            f"> {passage}",
+                            help="Fragmento con mayor coincidencia con la consulta"
+                        )
+
+            if pdf_path and os.path.exists(pdf_path):
+                pdf_bytes = load_pdf_bytes(pdf_path)
+                st.download_button(
+                    label=f"Descargar {r['title']}",
+                    data=pdf_bytes,
+                    file_name=os.path.basename(pdf_path),
+                    mime="application/pdf",
+                    key=f"download_{r['document_id']}_{i}"
+                )
+
+            st.divider()
 
 
 # ── Tab 2 — Matriz FrecT ────────────────────────────────────────────────────
@@ -476,10 +514,10 @@ def main():
     cfg = render_sidebar()
 
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🔍 Consulta",
-        "📊 Matriz FrecT",
-        "📐 Explorador SVD",
-        "📄 Documentos",
+        "Consulta",
+        "Matriz FrecT",
+        "Explorador SVD",
+        "Documentos",
     ])
     with tab1:
         render_query_tab(cfg)

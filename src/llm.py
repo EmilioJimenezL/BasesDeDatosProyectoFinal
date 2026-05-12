@@ -88,18 +88,32 @@ def detect_llm() -> dict:
     }
 
 
-def get_document_text(pdf_path: str, max_chars: int = 800) -> str:
-    """Return the first *max_chars* characters of a PDF's extracted text."""
+def get_document_text(pdf_path: str, query_tokens: list = None, max_chars: int = 800) -> str:
+    """Return relevant text from a PDF; finds best passage when query_tokens provided."""
     try:
         from src.pdf_extractor import extract_text
         text = extract_text(pdf_path)
-        return text[:max_chars]
+        if not text:
+            return ""
+        if not query_tokens:
+            return text[:max_chars]
+        tokens_set = set(t.lower() for t in query_tokens)
+        best_start = 0
+        best_score = -1
+        step = max(1, max_chars // 2)
+        for start in range(0, len(text), step):
+            chunk = text[start:start + max_chars]
+            score = sum(1 for tok in tokens_set if tok in chunk.lower())
+            if score > best_score:
+                best_score = score
+                best_start = start
+        return text[best_start:best_start + max_chars].strip()
     except Exception as e:
         logger.warning("Could not extract text from %s: %s", pdf_path, e)
         return ""
 
 
-def _build_prompt(query: str, results: list) -> str:
+def _build_prompt(query: str, results: list, query_tokens: list = None) -> str:
     """Compose the user prompt with the retrieved fragments inlined."""
     fragments_blocks = []
     for r in results:
@@ -109,7 +123,7 @@ def _build_prompt(query: str, results: list) -> str:
             url_full = os.path.join("data", "pdfs", url)
         else:
             url_full = url
-        text = get_document_text(url_full, max_chars=800)
+        text = get_document_text(url_full, query_tokens=query_tokens, max_chars=800)
         fragments_blocks.append(f"--- {r.get('title', 'doc')} ---\n{text}")
 
     fragments = "\n\n".join(fragments_blocks) if fragments_blocks else "(sin fragmentos)"
@@ -154,20 +168,64 @@ def _call_gemini(prompt: str) -> str | None:
         return None
 
 
-def synthesize(query: str, results: list, llm_info: dict) -> str | None:
+def get_available_models() -> dict:
+    """Returns all available LLM options for manual selection.
+
+    Returns a dict with 'options' (display strings), 'values' (provider/model
+    tuples), and 'default_index' (auto-detected best option).
+    """
+    options = []
+    values = []
+
+    options.append("Desactivado — solo recuperación")
+    values.append(('none', None))
+
+    try:
+        import requests as _req
+        resp = _req.get("http://localhost:11434/api/tags", timeout=2)
+        if resp.status_code == 200:
+            tags = resp.json().get('models', [])
+            for m in tags:
+                name = m.get('name', '')
+                if name:
+                    options.append(f"Local — {name}")
+                    values.append(('ollama', name))
+    except Exception:
+        pass
+
+    if os.getenv('GEMINI_API_KEY'):
+        options.append("Gemini 1.5 Flash (API)")
+        values.append(('gemini', 'gemini-1.5-flash'))
+
+    auto = detect_llm()
+    default_index = 0
+    for i, (provider, model) in enumerate(values):
+        if provider == auto['provider'] and model == auto['model']:
+            default_index = i
+            break
+
+    return {
+        'options': options,
+        'values': values,
+        'default_index': default_index
+    }
+
+
+def synthesize(query: str, results: list[dict],
+               provider: str, model: str | None,
+               query_tokens: list = None) -> str | None:
     """Generate a natural-language answer grounded in *results*.
 
-    Returns None when no LLM is available or the call fails — the caller
+    Returns None when provider is 'none' or the call fails — the caller
     must keep the UI functional regardless.
     """
-    if not llm_info or not llm_info.get("available"):
+    if provider == 'none':
         return None
 
-    prompt = _build_prompt(query, results or [])
-    provider = llm_info.get("provider")
+    prompt = _build_prompt(query, results or [], query_tokens=query_tokens)
 
     if provider == "ollama":
-        return _call_ollama(llm_info["model"], prompt)
+        return _call_ollama(model, prompt)
     if provider == "gemini":
         return _call_gemini(prompt)
     return None
